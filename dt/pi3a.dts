@@ -1,0 +1,21 @@
+/dts-v1/;
+/plugin/;
+/ {
+	/* Raspberry Pi 3 */
+	compatible = "brcm,bcm2837";
+
+	fragment@0 {
+		target = <&i2c1>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+            status = "okay";
+
+			custmcp23008: custmcp23008@20 {
+                compatible = "mr,custmcp23008";
+                reg = <0x20>;
+                status = "okay";
+            };
+		};
+	};
+};
