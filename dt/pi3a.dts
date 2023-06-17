@@ -13,6 +13,7 @@
 
 			custmcp23008: custmcp23008@20 {
                 compatible = "mr,custmcp23008";
+				gpio-controller;
                 reg = <0x20>;
                 status = "okay";
             };
