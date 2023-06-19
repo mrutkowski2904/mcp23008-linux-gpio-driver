@@ -2,6 +2,8 @@
 #include <linux/i2c.h>
 #include <linux/regmap.h>
 #include <linux/gpio.h>
+#include <linux/semaphore.h>
+#include <linux/workqueue.h>
 
 #define NUM_OF_GPIOS 8
 
@@ -23,6 +25,14 @@ struct mcp23008_context
     struct regmap *regmap;
     struct regmap_config regmap_cfg;
     struct gpio_chip gpiochip;
+
+    u8 irq_enable_mask;
+    struct semaphore irq_enable_sem;
+    struct work_struct irq_set_enable_work;
+
+    u8 irq_types_mask;
+    struct semaphore irq_types_sem;
+    struct work_struct irq_set_types_work;
 };
 
 /* chip operations */
@@ -30,6 +40,14 @@ static int mcp23008_get_value(struct gpio_chip *chip, unsigned int offset);
 static void mcp23008_set_value(struct gpio_chip *chip, unsigned int offset, int val);
 static int mcp23008_direction_output(struct gpio_chip *chip, unsigned int offset, int val);
 static int mcp23008_direction_input(struct gpio_chip *chip, unsigned int offset);
+static void mcp23008_irq_mask(struct irq_data *data);
+static void mcp23008_irq_unmask(struct irq_data *data);
+static int mcp23008_irq_set_type(struct irq_data *data, unsigned int flow_type);
+
+static void mcp23008_irq_set_enable_work_cb(struct work_struct *work);
+static void mcp23008_irq_set_types_work_cb(struct work_struct *work);
+
+static irqreturn_t mcp23008_irq_handler(int irq, void *data);
 
 static int mcp23008_direction(struct gpio_chip *chip, unsigned int offset, bool is_input, int val);
 
@@ -86,9 +104,17 @@ static const struct regmap_range mcp23008_rd_range[] = {
     },
 };
 
-struct regmap_access_table mcp23008_rd_table = {
+static struct regmap_access_table mcp23008_rd_table = {
     .yes_ranges = mcp23008_rd_range,
     .n_yes_ranges = ARRAY_SIZE(mcp23008_rd_range),
+};
+
+static struct irq_chip mcp23008_irq_chip = {
+    .name = "mcp23008",
+    .flags = (IRQCHIP_SET_TYPE_MASKED | IRQCHIP_IMMUTABLE),
+    .irq_mask = mcp23008_irq_mask,
+    .irq_unmask = mcp23008_irq_unmask,
+    .irq_set_type = mcp23008_irq_set_type,
 };
 
 static int mcp23008_get_value(struct gpio_chip *chip, unsigned int offset)
@@ -124,6 +150,147 @@ static int mcp23008_direction_output(struct gpio_chip *chip, unsigned int offset
 static int mcp23008_direction_input(struct gpio_chip *chip, unsigned int offset)
 {
     return mcp23008_direction(chip, offset, true, 0);
+}
+
+static void mcp23008_irq_mask(struct irq_data *data)
+{
+    struct gpio_chip *gc;
+    struct mcp23008_context *ctx;
+    irq_hw_number_t irq_num;
+
+    gc = irq_data_get_irq_chip_data(data);
+    ctx = gpiochip_get_data(gc);
+    irq_num = irqd_to_hwirq(data);
+
+    if (down_interruptible(&ctx->irq_enable_sem))
+        return;
+    ctx->irq_enable_mask &= ~(1 << irq_num);
+    up(&ctx->irq_enable_sem);
+
+    schedule_work(&ctx->irq_set_enable_work);
+}
+
+static void mcp23008_irq_unmask(struct irq_data *data)
+{
+    struct gpio_chip *gc;
+    struct mcp23008_context *ctx;
+    irq_hw_number_t irq_num;
+
+    gc = irq_data_get_irq_chip_data(data);
+    ctx = gpiochip_get_data(gc);
+    irq_num = irqd_to_hwirq(data);
+
+    if (down_interruptible(&ctx->irq_enable_sem))
+        return;
+    ctx->irq_enable_mask |= (1 << irq_num);
+    up(&ctx->irq_enable_sem);
+
+    schedule_work(&ctx->irq_set_enable_work);
+}
+
+static int mcp23008_irq_set_type(struct irq_data *data, unsigned int flow_type)
+{
+    int status;
+    struct gpio_chip *gc;
+    struct mcp23008_context *ctx;
+    irq_hw_number_t irq_num;
+
+    gc = irq_data_get_irq_chip_data(data);
+    ctx = gpiochip_get_data(gc);
+    irq_num = irqd_to_hwirq(data);
+    status = 0;
+
+    status = down_interruptible(&ctx->irq_types_sem);
+    if (status)
+        return status;
+
+    switch (flow_type)
+    {
+    case IRQ_TYPE_LEVEL_LOW:
+    case IRQ_TYPE_EDGE_FALLING:
+        ctx->irq_types_mask &= ~(1 << irq_num);
+        break;
+    case IRQ_TYPE_LEVEL_HIGH:
+    case IRQ_TYPE_EDGE_RISING:
+        ctx->irq_types_mask |= (1 << irq_num);
+        break;
+    default:
+        up(&ctx->irq_types_sem);
+        return -EINVAL;
+    }
+
+    up(&ctx->irq_types_sem);
+    schedule_work(&ctx->irq_set_types_work);
+    return status;
+}
+
+static void mcp23008_irq_set_enable_work_cb(struct work_struct *work)
+{
+    u8 enable_mask;
+    struct mcp23008_context *ctx;
+    ctx = container_of(work, struct mcp23008_context, irq_set_enable_work);
+
+    pr_info("DEBUG: setting enable mask work\n");
+
+    if (down_interruptible(&ctx->irq_enable_sem))
+        return;
+    enable_mask = ctx->irq_enable_mask;
+    up(&ctx->irq_enable_sem);
+
+    if (regmap_write(ctx->regmap, MCP23008_GPINTEN, enable_mask))
+        dev_err(&ctx->client->dev, "error while applying interrupt mask\n");
+}
+
+static void mcp23008_irq_set_types_work_cb(struct work_struct *work)
+{
+    u8 types_mask;
+    struct mcp23008_context *ctx;
+    ctx = container_of(work, struct mcp23008_context, irq_set_types_work);
+
+    pr_info("DEBUG: setting types work\n");
+
+    if (down_interruptible(&ctx->irq_types_sem))
+        return;
+    types_mask = ctx->irq_types_mask;
+    up(&ctx->irq_types_sem);
+
+    if (regmap_write(ctx->regmap, MCP23008_DEFVAL, types_mask))
+        dev_err(&ctx->client->dev, "error while setting interrupt types\n");
+}
+
+static irqreturn_t mcp23008_irq_handler(int irq, void *data)
+{
+    int read_value;
+    int status;
+    unsigned long i, irq_flags, child_irq;
+    struct mcp23008_context *ctx;
+
+    pr_info("DEBUG: in irq\n");
+
+    ctx = data;
+    status = regmap_read(ctx->regmap, MCP23008_INTF, &read_value);
+    if (status)
+    {
+        dev_err_ratelimited(&ctx->client->dev, "error while accessing the device in interrupt handler\n");
+        return IRQ_HANDLED;
+    }
+
+    irq_flags = read_value;
+    for_each_set_bit(i, &irq_flags, NUM_OF_GPIOS)
+    {
+        child_irq = irq_find_mapping(ctx->gpiochip.irq.domain, i);
+        handle_nested_irq(child_irq);
+    }
+
+    /* reset the interrupt flags */
+    status = regmap_read(ctx->regmap, MCP23008_INTCAP, &read_value);
+    if (status)
+    {
+        dev_err_ratelimited(&ctx->client->dev, "error while resetting the interrupt\n");
+        return IRQ_HANDLED;
+    }
+
+    return IRQ_HANDLED;
 }
 
 static int mcp23008_direction(struct gpio_chip *chip, unsigned int offset, bool is_input, int val)
@@ -163,6 +330,12 @@ static int mcp23008_probe(struct i2c_client *client, const struct i2c_device_id 
     i2c_set_clientdata(client, ctx);
     ctx->client = client;
 
+    sema_init(&ctx->irq_enable_sem, 1);
+    sema_init(&ctx->irq_types_sem, 1);
+
+    INIT_WORK(&ctx->irq_set_enable_work, mcp23008_irq_set_enable_work_cb);
+    INIT_WORK(&ctx->irq_set_types_work, mcp23008_irq_set_types_work_cb);
+
     ctx->regmap_cfg.reg_bits = 8;
     ctx->regmap_cfg.val_bits = 8;
     ctx->regmap_cfg.max_register = MCP23008_OLAT;
@@ -177,6 +350,17 @@ static int mcp23008_probe(struct i2c_client *client, const struct i2c_device_id 
     if (IS_ERR(ctx->regmap))
         return PTR_ERR(ctx->regmap);
 
+    /* configure the expander */
+    /* interrupt-on-change mode */
+    status = regmap_write(ctx->regmap, MCP23008_INTCON, 0xff);
+    if (status)
+        return status;
+
+    /* interrupt active-low */
+    status = regmap_write(ctx->regmap, MCP23008_IOCON, 0x00);
+    if (status)
+        return status;
+
     ctx->gpiochip.label = client->name;
     ctx->gpiochip.base = -1;
     ctx->gpiochip.owner = THIS_MODULE;
@@ -186,6 +370,25 @@ static int mcp23008_probe(struct i2c_client *client, const struct i2c_device_id 
     ctx->gpiochip.set = mcp23008_set_value;
     ctx->gpiochip.direction_input = mcp23008_direction_input;
     ctx->gpiochip.direction_output = mcp23008_direction_output;
+
+    ctx->gpiochip.irq.chip = &mcp23008_irq_chip;
+    ctx->gpiochip.irq.parent_handler = NULL;
+    ctx->gpiochip.irq.num_parents = 0;
+    ctx->gpiochip.irq.parents = NULL;
+    ctx->gpiochip.irq.default_type = IRQ_TYPE_NONE;
+    ctx->gpiochip.irq.handler = handle_level_irq;
+    ctx->gpiochip.irq.threaded = true;
+
+    status = devm_request_threaded_irq(&client->dev,
+                                       client->irq,
+                                       NULL,
+                                       mcp23008_irq_handler,
+                                       IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+                                       dev_name(&client->dev),
+                                       ctx);
+    if (status)
+        return status;
+
     status = devm_gpiochip_add_data(&client->dev, &ctx->gpiochip, ctx);
     if (status)
         return status;
@@ -197,6 +400,10 @@ static int mcp23008_probe(struct i2c_client *client, const struct i2c_device_id 
 
 static void mcp23008_remove(struct i2c_client *client)
 {
+    struct mcp23008_context *ctx;
+    ctx = i2c_get_clientdata(client);
+    cancel_work_sync(&ctx->irq_set_enable_work);
+    cancel_work_sync(&ctx->irq_set_types_work);
     dev_info(&client->dev, "mcp23008 gpio expander removed\n");
 }
 
