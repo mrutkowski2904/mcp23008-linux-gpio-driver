@@ -20,7 +20,7 @@
 				interrupt-controller;
  				#interrupt-cells = <2>;
 				interrupt-parent = <&gpio>;
-				interrupts = <&gpio 17 0x2>; /* falling edge */
+				interrupts = <27 0x8>; /* active low */
             };
 		};
 	};

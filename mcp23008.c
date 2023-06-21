@@ -208,11 +208,11 @@ static int mcp23008_irq_set_type(struct irq_data *data, unsigned int flow_type)
     {
     case IRQ_TYPE_LEVEL_LOW:
     case IRQ_TYPE_EDGE_FALLING:
-        ctx->irq_types_mask &= ~(1 << irq_num);
+        ctx->irq_types_mask |= (1 << irq_num);
         break;
     case IRQ_TYPE_LEVEL_HIGH:
     case IRQ_TYPE_EDGE_RISING:
-        ctx->irq_types_mask |= (1 << irq_num);
+        ctx->irq_types_mask &= ~(1 << irq_num);
         break;
     default:
         up(&ctx->irq_types_sem);
@@ -230,8 +230,6 @@ static void mcp23008_irq_set_enable_work_cb(struct work_struct *work)
     struct mcp23008_context *ctx;
     ctx = container_of(work, struct mcp23008_context, irq_set_enable_work);
 
-    pr_info("DEBUG: setting enable mask work\n");
-
     if (down_interruptible(&ctx->irq_enable_sem))
         return;
     enable_mask = ctx->irq_enable_mask;
@@ -246,8 +244,6 @@ static void mcp23008_irq_set_types_work_cb(struct work_struct *work)
     u8 types_mask;
     struct mcp23008_context *ctx;
     ctx = container_of(work, struct mcp23008_context, irq_set_types_work);
-
-    pr_info("DEBUG: setting types work\n");
 
     if (down_interruptible(&ctx->irq_types_sem))
         return;
@@ -264,8 +260,6 @@ static irqreturn_t mcp23008_irq_handler(int irq, void *data)
     int status;
     unsigned long i, irq_flags, child_irq;
     struct mcp23008_context *ctx;
-
-    pr_info("DEBUG: in irq\n");
 
     ctx = data;
     status = regmap_read(ctx->regmap, MCP23008_INTF, &read_value);
@@ -356,8 +350,8 @@ static int mcp23008_probe(struct i2c_client *client, const struct i2c_device_id 
     if (status)
         return status;
 
-    /* interrupt active-low */
-    status = regmap_write(ctx->regmap, MCP23008_IOCON, 0x00);
+    /* interrupt pin as open-drain */
+    status = regmap_write(ctx->regmap, MCP23008_IOCON, (1 << 2));
     if (status)
         return status;
 
@@ -383,7 +377,7 @@ static int mcp23008_probe(struct i2c_client *client, const struct i2c_device_id 
                                        client->irq,
                                        NULL,
                                        mcp23008_irq_handler,
-                                       IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+                                       IRQF_ONESHOT,
                                        dev_name(&client->dev),
                                        ctx);
     if (status)
